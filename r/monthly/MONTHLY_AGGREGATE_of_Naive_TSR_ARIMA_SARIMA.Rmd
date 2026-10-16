@@ -1,0 +1,1067 @@
+---
+title: "Time Series Forecasting: Monthly Rainfall Jakarta (2010-2026)"
+date: "`r Sys.Date()`"
+output:
+  word_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 5, dpi = 150)
+```
+
+---
+
+# 1. Introduction
+
+This document presents the full workflow for time series forecasting of monthly rainfall in Jakarta using data sourced from **NASA/POWER MERRA-2**. 
+
+Monthly aggregation using **total rainfall per month (mm/month)** is chosen over daily data for the following reasons:
+
+- Daily rainfall data contains high noise and many zero-value days, making it harder to detect seasonal patterns
+- Monthly totals smooth out daily variability while preserving the wet-dry seasonal cycle
+- All forecasting models (Seasonal Naive, TSR Seasonal, ARIMA, SARIMA, NN, LSTM, GRU) are evaluated on the same monthly scale, ensuring fair and direct comparison
+
+This EDA section covers data structure, visualization, outlier analysis, stationarity testing, and preprocessing before fitting any model.
+
+---
+
+# 2. Library and Data Loading
+
+```{r libraries}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(tseries)
+library(forecast)
+library(moments)
+library(zoo)
+library(lmtest)
+library(car)
+library(nortest)
+library(Metrics)
+library(tidyr)
+```
+
+```{r load-data}
+df_raw <- read_excel("data/Dataset16Tahun.xlsx")
+
+names(df_raw)
+
+df_daily <- df_raw %>%
+  mutate(
+    Date = as.Date(
+      paste(YEAR, MO, DOY, sep = "-")
+    ),
+    rain = as.numeric(PRECTOTCORR)
+  ) %>%
+  arrange(Date)
+
+cat("Daily data loaded:", nrow(df_daily), "observations\n")
+cat("Period:", format(min(df_daily$Date)), "to", format(max(df_daily$Date)), "\n")
+
+head(df_daily)
+```
+
+---
+
+# 3. Dataset Structure (Daily)
+
+## 3.1 Basic Structure
+
+```{r structure}
+str(df_daily)
+```
+
+## 3.2 Observations per Year
+
+```{r obs-per-year}
+df_daily %>%
+  group_by(YEAR) %>%
+  summarise(Total_Days = n()) %>%
+  knitr::kable(caption = "Daily observations per year")
+```
+
+Years 2012, 2016, 2020, and 2024 contain 366 observations (leap years). All other years have 365.
+
+## 3.3 Missing Values and Data Quality
+
+```{r missing-values}
+cat("Missing (NA)   :", sum(is.na(df_daily$rain)), "\n")
+cat("Sentinel -999  :", sum(df_daily$rain == -999, na.rm = TRUE), "\n")
+cat("Zero-rain days :", sum(df_daily$rain == 0, na.rm = TRUE), "\n")
+cat("Duplicate dates:", sum(duplicated(df_daily$Date)), "\n")
+```
+The dataset is clean with no missing values or encoding errors. Zero-rainfall days represent valid dry days and are retained.
+
+## 3.4 Descriptive Statistics (Daily)
+
+```{r summary-daily}
+summary_daily <- df_daily %>%
+  summarise(
+    N        = n(),
+    Mean     = round(mean(rain, na.rm = TRUE), 3),
+    Median   = round(median(rain, na.rm = TRUE), 3),
+    SD       = round(sd(rain, na.rm = TRUE), 3),
+    Min      = round(min(rain, na.rm = TRUE), 3),
+    Q1       = round(quantile(rain, 0.25, na.rm = TRUE), 3),
+    Q3       = round(quantile(rain, 0.75, na.rm = TRUE), 3),
+    Max      = round(max(rain, na.rm = TRUE), 3),
+    Skewness = round(skewness(rain, na.rm = TRUE), 3),
+    Kurtosis = round(kurtosis(rain, na.rm = TRUE), 3)
+  )
+
+knitr::kable(t(summary_daily), col.names = "Value",
+             caption = "Descriptive statistics of daily rainfall (mm/day)")
+```
+
+Daily rainfall is strongly right-skewed (skewness > 3.5) due to many dry days near zero and occasional extreme monsoon events. The mean (6.58 mm/day) far exceeds the median (3.94 mm/day), a typical pattern for tropical precipitation.
+
+---
+
+# 4. Time Series Visualization
+
+## 4.1 Daily Raw Series
+
+```{r plot-daily, fig.height=4}
+ggplot(df_daily, aes(x = Date, y = rain)) +
+  geom_line(color = "#2C7BB6", linewidth = 0.3, alpha = 0.7) +
+  labs(title = "Daily Rainfall in Jakarta (2010-2025)",
+       subtitle = "Source: NASA/POWER MERRA-2",
+       x = "Date", y = "Rainfall (mm/day)") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+Daily data shows high volatility with many zero values and sharp spikes during monsoon events. This noise makes it difficult to model directly, which is one reason for monthly aggregation.
+
+## 4.2 Histogram dan Distribusi Harian
+
+```{r hist-daily, fig.height=4}
+par(mfrow = c(1, 2))
+hist(df_daily$rain, breaks = 60, col = "#4575B4", border = "white",
+     main = "Daily Rainfall Distribution", xlab = "mm/day",
+     xlim = c(0, 110))
+hist(log1p(df_daily$rain), breaks = 40, col = "#74ADD1", border = "white",
+     main = "Log(1+x) Transformed", xlab = "log(1 + mm/day)")
+par(mfrow = c(1, 1))
+```
+
+The raw distribution is heavily right-skewed. Log transformation substantially reduces skewness and brings the distribution closer to symmetric, which improves fit for parametric models.
+
+## 4.3 Monthly Total Rainfall
+
+```{r monthly-agg-plot, fig.height=4}
+df_monthly_raw <- df_daily %>%
+  group_by(YEAR, MO) %>%
+  summarise(rain_monthly = sum(rain, na.rm = TRUE), .groups = "drop") %>%
+  mutate(YearMonth = as.Date(paste(YEAR, MO, "01", sep = "-")))
+
+ggplot(df_monthly_raw, aes(x = YearMonth, y = rain_monthly)) +
+  geom_col(fill = "#4575B4", alpha = 0.85) +
+  geom_smooth(method = "loess", color = "#D73027", se = FALSE, linewidth = 1) +
+  labs(title = "Monthly Total Rainfall in Jakarta (2020-2025)",
+       x = "Month", y = "Total Rainfall (mm/month)") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+Monthly aggregation clearly reveals the wet-dry seasonal cycle. Rainfall peaks from November to March (monsoon season) and drops significantly from June to September (dry season). This annual pattern is consistent across all five years.
+
+## 4.4 Seasonal Distribution by Month (Boxplot)
+
+```{r seasonal-boxplot, fig.height=5}
+df_monthly_raw %>%
+  mutate(Month = factor(month.abb[MO], levels = month.abb)) %>%
+  ggplot(aes(x = Month, y = rain_monthly, fill = Month)) +
+  geom_boxplot(outlier.shape = 21, outlier.size = 2) +
+  scale_fill_brewer(palette = "RdYlBu", direction = -1) +
+  labs(title = "Monthly Rainfall Distribution by Month (2010-2026)",
+       x = "Month", y = "Total Rainfall (mm/month)") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "none")
+```
+
+January and February consistently show the highest median monthly rainfall, while July and August are the driest. The spread within each month (interquartile range) is widest during the wet season, reflecting year-to-year variability in monsoon intensity.
+
+
+---
+
+# 5. Outlier Analysis (Daily Level)
+
+Outlier analysis is performed on daily data before aggregation. Extreme daily values are caused by real meteorological events (heavy storms, monsoon surges), not measurement errors.
+
+## 5.1 Identification with IQR
+
+```{r outlier-identify}
+Q1            <- quantile(df_daily$rain, 0.25, na.rm = TRUE)
+Q3            <- quantile(df_daily$rain, 0.75, na.rm = TRUE)
+IQR_val       <- IQR(df_daily$rain, na.rm = TRUE)
+bound_mild    <- Q3 + 1.5 * IQR_val
+bound_extreme <- Q3 + 3.0 * IQR_val
+
+cat("Q1  :", round(Q1, 2), "mm\n")
+cat("Q3  :", round(Q3, 2), "mm\n")
+cat("IQR :", round(IQR_val, 2), "mm\n")
+cat("Mild outlier threshold (1.5*IQR)   :", round(bound_mild, 2), "mm\n")
+cat("Extreme outlier threshold (3.0*IQR):", round(bound_extreme, 2), "mm\n\n")
+
+df_daily <- df_daily %>%
+  mutate(outlier_cat = case_when(
+    rain > bound_extreme ~ "Extreme",
+    rain > bound_mild    ~ "Mild",
+    TRUE                 ~ "Normal"
+  ))
+
+print(table(df_daily$outlier_cat))
+```
+
+The IQR method uses 3x IQR (instead of the standard 1.5x) as the extreme threshold because daily rainfall follows a naturally heavy-tailed distribution. Using 1.5x would flag too many legitimate monsoon events as outliers.
+
+## 5.2 Visualisasi Outlier
+
+```{r outlier-plot, fig.height=4}
+ggplot(df_daily, aes(x = Date, y = rain)) +
+  geom_line(color = "grey70", linewidth = 0.3) +
+  geom_point(data = filter(df_daily, outlier_cat == "Extreme"),
+             aes(color = "Extreme"), size = 1.8) +
+  geom_point(data = filter(df_daily, outlier_cat == "Mild"),
+             aes(color = "Mild"), size = 1.2, alpha = 0.6) +
+  scale_color_manual(values = c("Extreme" = "#D73027", "Mild" = "#FC8D59")) +
+  labs(title = "Identified Outliers in Daily Rainfall",
+       x = "Date", y = "Rainfall (mm/day)", color = "Outlier") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+
+---
+
+# 6. Monthly Aggregation
+
+All models are fitted on **monthly total rainfall**. The daily data (after winsorizing) is aggregated to monthly totals.
+
+```{r monthly-aggregate}
+df_monthly <- df_daily %>%
+  mutate(
+    YEAR = year(Date),
+    MO   = month(Date)
+  ) %>%
+  group_by(YEAR, MO) %>%
+  summarise(
+    rain_monthly = sum(rain, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(YEAR, MO) %>%
+  mutate(
+    YearMonth = as.Date(
+      paste(YEAR, MO, "01", sep = "-")
+    ),
+    t = row_number(),
+    rain_log = log1p(rain_monthly),
+
+    # dummy month (Jan baseline)
+    M2  = as.integer(MO == 2),
+    M3  = as.integer(MO == 3),
+    M4  = as.integer(MO == 4),
+    M5  = as.integer(MO == 5),
+    M6  = as.integer(MO == 6),
+    M7  = as.integer(MO == 7),
+    M8  = as.integer(MO == 8),
+    M9  = as.integer(MO == 9),
+    M10 = as.integer(MO == 10),
+    M11 = as.integer(MO == 11),
+    M12 = as.integer(MO == 12),
+
+    # monthly lags
+    lag1 = lag(rain_monthly, 1),
+    lag2 = lag(rain_monthly, 2),
+    lag3 = lag(rain_monthly, 3)
+  )
+
+cat(
+  "Monthly data:",
+  nrow(df_monthly),
+  "observations\n"
+)
+
+cat(
+  "Period:",
+  format(min(df_monthly$YearMonth)),
+  "to",
+  format(max(df_monthly$YearMonth)),
+  "\n"
+)
+```
+
+```{r monthly-stats}
+summary_monthly <- df_monthly %>%
+  summarise(
+    N        = n(),
+    Mean     = round(mean(rain_monthly), 2),
+    Median   = round(median(rain_monthly), 2),
+    SD       = round(sd(rain_monthly), 2),
+    Min      = round(min(rain_monthly), 2),
+    Max      = round(max(rain_monthly), 2),
+    Skewness = round(skewness(rain_monthly), 3)
+  )
+
+knitr::kable(t(summary_monthly), col.names = "Value",
+             caption = "Descriptive statistics of monthly total rainfall (mm/month)")
+```
+
+---
+
+# 7. Stationarity Analysis (Monthly)
+
+## 7.1 Monthly Time Series Object
+
+```{r monthly-ts-obj}
+rain_monthly_ts <- ts(df_monthly$rain_monthly, start = c(2010, 1), frequency = 12)
+```
+
+## 7.2 Visual Inspection
+
+```{r monthly-ts-plot, fig.height=4}
+autoplot(rain_monthly_ts) +
+  labs(title = "Monthly Total Rainfall Time Series (2010-2025)",
+       x = "Year", y = "Total Rainfall (mm/month)") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+## 7.3 Decomposition Plot
+
+```{r decompose-plot, fig.height=6}
+plot(decompose(rain_monthly_ts, type = "additive"))
+```
+
+Decomposition separates the series into three components:
+
+- **Trend**: no clear long-term upward or downward drift, consistent with stable climate over 5 years
+- **Seasonal**: a strong and consistent annual cycle (S = 12) repeating every year
+- **Residual**: the remaining random variation after removing trend and seasonal components
+
+The additive model is appropriate here because the seasonal amplitude (height of the peaks) stays roughly constant across years, rather than growing proportionally with the trend.
+
+## 7.4 Variance Stationarity
+
+```{r boxcox-monthly}
+lambda_monthly <- BoxCox.lambda(rain_monthly_ts + 1)
+cat("BoxCox lambda (monthly):", round(lambda_monthly, 4), "\n")
+cat("Lambda mendekati 0 -> log transform disarankan\n")
+cat("Lambda mendekati 1 -> varians sudah stabil\n\n")
+
+summary(powerTransform(rain_monthly_ts))
+```
+
+H0: lambda = 1 (variance stationary). If p-value < 0.05, log transformation is recommended.
+
+## 7.5 ACF dan PACF (Monthly)
+
+```{r monthly-acf-pacf, fig.height=5}
+par(mfrow = c(1, 2))
+acf(rain_monthly_ts, lag.max = 36, main = "ACF - Monthly Rainfall", col = "#2166AC")
+pacf(rain_monthly_ts, lag.max = 36, main = "PACF - Monthly Rainfall", col = "#D73027")
+par(mfrow = c(1, 1))
+```
+
+**ACF interpretation:** The ACF shows a relatively strong positive autocorrelation at the first lag, indicating that monthly rainfall is influenced by rainfall in the preceding month. Significant spikes are also observed around lags 12, 24, and 36, suggesting the presence of a recurring annual seasonal pattern. The repeating peaks at multiples of 12 months indicate that rainfall behavior tends to repeat from year to year, which is consistent with the monsoonal climate of the study area. Furthermore, the autocorrelations do not cut off abruptly but instead decay gradually, implying that an autoregressive structure may be present in the series.
+
+**PACF interpretation:** The PACF exhibits a dominant spike at lag 1 followed by substantially smaller values at subsequent lags. This pattern suggests that a low-order autoregressive component, particularly AR(1), may adequately capture the non-seasonal dependence in the data. Additional significant spikes around lag 12 provide further evidence of annual seasonality and indicate the possible inclusion of a seasonal autoregressive component.
+
+Based on the ACF and PACF patterns, the monthly rainfall series appears to contain:
+
+- A non-seasonal autoregressive component, likely AR(1)
+- A strong annual seasonal cycle with period S=12
+- Potential seasonal AR and/or seasonal MA effects
+
+## 7.6 ADF Test
+
+```{r adf-monthly}
+adf_monthly <- adf.test(rain_monthly_ts, alternative = "stationary")
+print(adf_monthly)
+
+if (adf_monthly$p.value < 0.05) {
+  cat("\np-value < 0.05 -> data STASIONER (d = 0)\n")
+} else {
+  cat("\np-value > 0.05 -> data TIDAK stasioner -> pertimbangkan differencing (d = 1)\n")
+}
+```
+
+## 7.7 Log Transformation Check (Monthly)
+
+```{r log-monthly, fig.height=4}
+par(mfrow = c(1, 2))
+hist(df_monthly$rain_monthly, breaks = 20, col = "#4575B4", border = "white",
+     main = "Monthly Rainfall (Original)", xlab = "mm/month")
+hist(df_monthly$rain_log, breaks = 20, col = "#74ADD1", border = "white",
+     main = "Log(1+x) Transformed", xlab = "log(1 + mm/month)")
+par(mfrow = c(1, 1))
+
+cat("Skewness original    :", round(skewness(df_monthly$rain_monthly), 3), "\n")
+cat("Skewness log-tranform:", round(skewness(df_monthly$rain_log), 3), "\n")
+```
+
+---
+
+# 8. Train-Test Split
+
+All models use the same 80/20 split on monthly data. The split is sequential (not random) to preserve temporal order.
+
+```{r train-test-monthly}
+n_total   <- nrow(df_monthly)
+n_train   <- floor(0.8 * n_total)
+n_test    <- n_total - n_train
+
+train_df  <- df_monthly[1:n_train, ]
+test_df   <- df_monthly[(n_train + 1):n_total, ]
+
+cat("Total monthly obs :", n_total, "\n")
+cat("Train:", n_train, "months |",
+    format(min(train_df$YearMonth)), "to", format(max(train_df$YearMonth)), "\n")
+cat("Test :", n_test, "months  |",
+    format(min(test_df$YearMonth)), "to", format(max(test_df$YearMonth)), "\n")
+
+# ts objects
+train_monthly_ts <- ts(
+  train_df$rain_monthly,
+  start = c(2010,1),
+  frequency = 12
+)
+test_monthly_ts  <- ts(test_df$rain_monthly,
+                       start = c(year(min(test_df$YearMonth)), month(min(test_df$YearMonth))), frequency = 12)
+
+train_monthly_log <- ts(
+  train_df$rain_log,
+  start = c(2010,1),
+  frequency = 12
+)
+test_monthly_log  <- ts(test_df$rain_log,
+                        start = c(year(min(test_df$YearMonth)),
+                                  month(min(test_df$YearMonth))),
+                        frequency = 12)
+```
+
+```{r}
+#Extra safe
+train_monthly_ts <- ts(
+  train_df$rain_monthly,
+  start = c(2010,1),
+  frequency = 12
+)
+
+test_monthly_ts <- ts(
+  test_df$rain_monthly,
+  start = c(
+    year(min(test_df$YearMonth)),
+    month(min(test_df$YearMonth))
+  ),
+  frequency = 12
+)
+
+train_monthly_log <- ts(
+  train_df$rain_log,
+  start = c(2010,1),
+  frequency = 12
+)
+
+test_monthly_log <- ts(
+  test_df$rain_log,
+  start = c(
+    year(min(test_df$YearMonth)),
+    month(min(test_df$YearMonth))
+  ),
+  frequency = 12
+)
+```
+
+
+```{r split-plot, fig.height=4}
+df_monthly %>%
+  mutate(Set = ifelse(YearMonth <= max(train_df$YearMonth), "Training", "Test")) %>%
+  ggplot(aes(x = YearMonth, y = rain_monthly, color = Set)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("Training" = "#2166AC", "Test" = "#D73027")) +
+  labs(title = "Train-Test Split: Monthly Rainfall (80% / 20%)",
+       x = "Month", y = "Total Rainfall (mm/month)", color = "Set") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+---
+
+# 9. Modeling
+
+Semua model difit dan dievaluasi pada **data bulanan** (mm/month). Evaluasi menggunakan tiga metrik:
+
+- **RMSE** — sensitif terhadap error besar, unit sama dengan data
+- **MAE** — rata-rata besar error, lebih robust terhadap nilai ekstrem
+- **MAPE** — error dalam persentase
+
+**catatan:** MAPE dapat tidak stabil ketika nilai aktual mendekati nol, sehingga RMSE dan MAE lebih diutamakan sebagai metrik utama
+
+```{r eval-function}
+eval_metrics <- function(actual, predicted, model_name) {
+  mask     <- actual > 0
+  rmse_val <- rmse(actual, predicted)
+  mae_val  <- mean(abs(actual - predicted))
+  mape_val <- mean(abs((actual[mask] - predicted[mask]) / actual[mask])) * 100
+  cat(model_name, "\n")
+  cat("  RMSE:", round(rmse_val, 4), "| MAE:", round(mae_val, 4),
+      "| MAPE:", round(mape_val, 2), "%\n\n")
+  data.frame(Model = model_name,
+             RMSE  = round(rmse_val, 4),
+             MAE   = round(mae_val, 4),
+             MAPE  = round(mape_val, 2))
+}
+```
+
+---
+
+## 9.1 Baseline Models
+
+Sebelum model utama, ditetapkan dua **baseline sederhana** sebagai acuan minimum performa. Model yang baik seharusnya mengalahkan baseline ini. Jika tidak, perlu dievaluasi apakah model terlalu kompleks atau data memang sulit diprediksi.
+
+```{r baseline}
+actual_base <- as.numeric(test_monthly_ts)
+
+# Seasonal Naive: prediksi = nilai bulan yang sama dari tahun sebelumnya
+# baseline yang kuat untuk data dengan seasonality tahunan yang konsisten
+snaive_fc   <- snaive(train_monthly_ts, h = length(test_monthly_ts))
+yhat_snaive <- as.numeric(snaive_fc$mean)
+
+result_snaive <- eval_metrics(actual_base, yhat_snaive, "Seasonal Naive")
+rmse_snaive   <- result_snaive$RMSE
+mae_snaive    <- result_snaive$MAE
+mape_snaive   <- result_snaive$MAPE
+```
+
+Seasonal Naive sangat relevan untuk data curah hujan karena pola musiman Jakarta sangat kuat dan berulang setiap tahun. Jika model ML tidak mampu mengalahkan Seasonal Naive, itu menandakan model yg lebih kompleks tidak cocok pada dataset ini.
+
+---
+
+## 9.2 Time Series Regression Seasonal (TSR Seasonal)
+
+TSR Seasonal meregresikan curah hujan bulanan terhadap **dummy variabel bulan** dan lag bulan sebelumnya. Setiap koefisien dummy menunjukkan perbedaan rata-rata curah hujan bulan tersebut dibandingkan Januari (baseline/referensi). Misalnya, jika koefisien M2 = +80, artinya Februari rata-rata 80 mm lebih basah dari Januari setelah mengontrol variabel lain.
+
+```{r tsr-setup}
+df_train_tsr <- train_df %>%
+  filter(
+    !is.na(lag1),
+    !is.na(lag2),
+    !is.na(lag3)
+  )
+
+cat("Training obs for TSR:",
+    nrow(df_train_tsr),
+    "\n")
+```
+
+```{r tsr-models}
+dummy_vars <- "M2+M3+M4+M5+M6+M7+M8+M9+M10+M11+M12"
+
+m1 <- lm(as.formula(paste("rain_monthly ~", dummy_vars)), data = df_train_tsr)
+m2 <- lm(as.formula(paste("rain_monthly ~ t +", dummy_vars)), data = df_train_tsr)
+m3 <- lm(as.formula(paste("rain_monthly ~ lag1 + t +", dummy_vars)), data = df_train_tsr)
+m4 <- lm(as.formula(paste("rain_monthly ~ lag1 + lag2 + t +", dummy_vars)), data = df_train_tsr)
+m5 <- lm(as.formula(paste("rain_monthly ~ lag1 + lag2 + lag3 + t +", dummy_vars)),
+         data = df_train_tsr)
+```
+
+```{r tsr-eval-train}
+eval_tsr <- function(model, nama, train_data) {
+  actual    <- train_data$rain_monthly
+  predicted <- fitted(model)
+  idx       <- actual > 0
+  data.frame(
+    Model  = nama,
+    Adj_R2 = round(summary(model)$adj.r.squared, 4),
+    RMSE   = round(rmse(actual, predicted), 4),
+    MAE    = round(mean(abs(actual - predicted)), 4),
+    MAPE   = round(mean(abs((actual[idx] - predicted[idx]) / actual[idx])) * 100, 2),
+    AIC    = round(AIC(model), 2),
+    DW     = round(as.numeric(dwtest(model)$statistic), 4)
+  )
+}
+
+tabel_tsr <- bind_rows(
+  eval_tsr(m1, "Dummy Seasonal Only",           df_train_tsr),
+  eval_tsr(m2, "Trend + Dummy",                  df_train_tsr),
+  eval_tsr(m3, "Lag1 + Trend + Dummy",           df_train_tsr),
+  eval_tsr(m4, "Lag1+Lag2 + Trend + Dummy",      df_train_tsr),
+  eval_tsr(m5, "Lag1+Lag2+Lag3 + Trend + Dummy", df_train_tsr)
+)
+knitr::kable(tabel_tsr, caption = "TSR Seasonal Model Comparison (Training Set)")
+```
+
+```{r}
+# tambahan
+eval_tsr_test <- function(model, test_data, nama){
+
+  pred <- predict(model, newdata = test_data)
+
+  actual <- test_data$rain_monthly
+
+  idx <- actual > 0
+
+  data.frame(
+    Model = nama,
+    RMSE = round(rmse(actual, pred),4),
+    MAE  = round(mae(actual, pred),4),
+    MAPE = round(mean(abs((actual[idx]-pred[idx])/
+                            actual[idx]))*100,2)
+  )
+}
+
+tsr_test_compare <- bind_rows(
+
+  eval_tsr_test(
+    m1,
+    test_df,
+    "Dummy Seasonal Only"
+  ),
+
+  eval_tsr_test(
+    m2,
+    test_df,
+    "Trend + Dummy"
+  ),
+
+  eval_tsr_test(
+    m3,
+    test_df,
+    "Lag1 + Trend + Dummy"
+  ),
+
+  eval_tsr_test(
+    m4,
+    test_df,
+    "Lag1+Lag2 + Trend + Dummy"
+  ),
+
+  eval_tsr_test(
+    m5,
+    test_df,
+    "Lag1+Lag2+Lag3 + Trend + Dummy"
+  )
+
+)
+
+tsr_test_compare[order(tsr_test_compare$RMSE), ]
+```
+
+```{r tsr-best}
+best_tsr_idx <- which.max(tabel_tsr$Adj_R2)
+best_tsr     <- list(m1, m2, m3, m4, m5)[[best_tsr_idx]]
+cat("Best TSR model:", tabel_tsr$Model[best_tsr_idx], "\n\n")
+summary(best_tsr)
+```
+
+```{r tsr-vif}
+cat("VIF values (best model):\n")
+print(round(vif(best_tsr), 2))
+cat("\nVIF > 10 = multikolinearitas serius\n")
+```
+
+```{r}
+#ubah
+# ==========================
+# Recursive Forecast TSR
+# ==========================
+
+h <- nrow(test_df)
+
+yhat_tsr <- numeric(h)
+
+last_train <- tail(train_df$rain_monthly, 1)
+
+for(i in 1:h){
+
+  row_i <- test_df[i, ]
+
+  row_i$lag1 <- last_train
+
+  pred_i <- predict(best_tsr, newdata = row_i)
+
+  yhat_tsr[i] <- pred_i
+
+  # update lag untuk step berikutnya
+  last_train <- pred_i
+}
+
+actual_tsr <- test_df$rain_monthly
+
+idx <- actual_tsr > 0
+
+rmse_tsr <- rmse(actual_tsr, yhat_tsr)
+
+mae_tsr <- mae(actual_tsr, yhat_tsr)
+
+mape_tsr <- mean(
+  abs((actual_tsr[idx] - yhat_tsr[idx]) /
+      actual_tsr[idx])
+) * 100
+
+cat("\nTSR Seasonal (Recursive Test Forecast)\n")
+cat("RMSE:", round(rmse_tsr,4),
+    "| MAE:", round(mae_tsr,4),
+    "| MAPE:", round(mape_tsr,2), "%\n")
+```
+
+
+```{r tsr-forecast-test}
+df_full_tsr <- bind_rows(train_df, test_df) %>%
+  mutate(lag1 = lag(rain_monthly, 1),
+         lag2 = lag(rain_monthly, 2),
+         lag3 = lag(rain_monthly, 3))
+
+df_test_pred    <- df_full_tsr %>% filter(YearMonth %in% test_df$YearMonth)
+yhat_tsr_test   <- predict(best_tsr, newdata = df_test_pred)
+actual_tsr_test <- df_test_pred$rain_monthly
+
+result_tsr <- eval_metrics(actual_tsr_test, yhat_tsr_test, "TSR Seasonal (Test)")
+rmse_tsr   <- result_tsr$RMSE
+mae_tsr    <- result_tsr$MAE
+mape_tsr   <- result_tsr$MAPE
+```
+
+```{r tsr-plot, fig.height=4}
+n_lag_na      <- n_train - length(fitted(best_tsr))
+fitted_padded <- c(rep(NA, n_lag_na), fitted(best_tsr), rep(NA, n_test))
+
+df_monthly %>%
+  mutate(Set    = ifelse(YearMonth <= max(train_df$YearMonth), "Training", "Test"),
+         Fitted = fitted_padded) %>%
+  ggplot(aes(x = YearMonth)) +
+  geom_line(aes(y = rain_monthly, color = Set), linewidth = 0.7) +
+  geom_line(aes(y = Fitted), color = "#E24B4A", linewidth = 0.8,
+            linetype = "dashed", na.rm = TRUE) +
+  scale_color_manual(values = c("Training" = "#2166AC", "Test" = "grey50")) +
+  labs(title = paste("TSR Seasonal - Actual vs Fitted:", tabel_tsr$Model[best_tsr_idx]),
+       x = "Month", y = "Rainfall (mm/month)", color = "Set") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r tsr-residual-analysis, fig.height=8}
+resid_tsr  <- residuals(best_tsr)
+fitted_tsr <- fitted(best_tsr)
+
+par(mfrow = c(2, 2))
+plot(fitted_tsr, resid_tsr, pch = 16, col = "#378ADD",
+     main = "Residuals vs Fitted - TSR",
+     xlab = "Fitted Values (mm/month)", ylab = "Residuals")
+abline(h = 0, col = "#D73027", lty = 2)
+
+hist(resid_tsr, breaks = 15, col = "#74ADD1", border = "white",
+     main = "Histogram of Residuals - TSR", xlab = "Residuals (mm/month)")
+
+qqnorm(resid_tsr, main = "Q-Q Plot - TSR Residuals", col = "#378ADD", pch = 16)
+qqline(resid_tsr, col = "#D73027", lwd = 2)
+
+acf(resid_tsr, main = "ACF of Residuals - TSR", col = "#2166AC")
+par(mfrow = c(1, 1))
+```
+
+Plot residual vs fitted menunjukkan apakah masih ada pola yang belum tertangkap. QQ plot dan histogram memeriksa normalitas residual. ACF residual memeriksa sisa autokorelasi — idealnya semua lag berada dalam batas signifikansi.
+
+---
+
+## 9.3 ARIMA
+
+ARIMA (p,d,q) memodelkan dependensi linier antar observasi melalui komponen AR dan MA. Difit pada **log-transformed monthly data** untuk menstabilkan varians. Forecast dikembalikan ke skala asli dengan `expm1()`.
+
+```{r arima-stasioner}
+summary(powerTransform(train_monthly_ts))
+adf.test(train_monthly_log)
+```
+
+```{r arima-acf-pacf, fig.height=5}
+par(mfrow = c(1, 2))
+acf(train_monthly_log, lag.max = 24, main = "ACF - Monthly log(rain)", col = "#2166AC")
+pacf(train_monthly_log, lag.max = 24, main = "PACF - Monthly log(rain)", col = "#D73027")
+par(mfrow = c(1, 1))
+```
+
+```{r arima-kandidat}
+arima_100 <- Arima(train_monthly_log, order = c(1,0,0))
+arima_200 <- Arima(train_monthly_log, order = c(2,0,0))
+arima_010 <- Arima(train_monthly_log, order = c(0,1,0))
+arima_101 <- Arima(train_monthly_log, order = c(1,0,1))
+arima_201 <- Arima(train_monthly_log, order = c(2,0,1))
+arima_011 <- Arima(train_monthly_log, order = c(0,1,1))
+arima_111 <- Arima(train_monthly_log, order = c(1,1,1))
+arima_211 <- Arima(train_monthly_log, order = c(2,1,1))
+arima_012 <- Arima(train_monthly_log, order = c(0,1,2))
+
+arima_aic <- data.frame(
+  Model = c("ARIMA(1,0,0)","ARIMA(2,0,0)","ARIMA(0,1,0)",
+            "ARIMA(1,0,1)","ARIMA(2,0,1)","ARIMA(0,1,1)",
+            "ARIMA(1,1,1)","ARIMA(2,1,1)","ARIMA(0,1,2)"),
+  AIC   = c(AIC(arima_100), AIC(arima_200), AIC(arima_010),
+            AIC(arima_101), AIC(arima_201), AIC(arima_011),
+            AIC(arima_111), AIC(arima_211), AIC(arima_012))
+)
+arima_aic[order(arima_aic$AIC), ]
+```
+
+```{r arima-auto}
+fit_auto_arima <- auto.arima(train_monthly_log, seasonal = FALSE)
+summary(fit_auto_arima)
+```
+
+```{r arima-coeftest}
+library(lmtest)
+coeftest(arima_101)
+coeftest(arima_201)
+```
+
+```{r arima-diagnostic}
+library(nortest)
+e_arima <- residuals(arima_201)
+lillie.test(e_arima)
+Box.test(e_arima, lag = 12, type = "Ljung-Box")
+checkresiduals(arima_201)
+```
+
+H₀: residual berdistribusi normal
+H₁: residual tidak berdistribusi normal
+
+H₀: residual merupakan white noise (tidak ada autokorelasi tersisa)
+H₁: residual masih mengandung autokorelasi
+
+Karena kedua p-value jauh lebih kecil dari 0.05, maka:
+The residuals are not white noise and still exhibit significant autocorrelation. Therefore, the ARIMA(1,0,1) model has not fully captured the temporal dependence in the monthly rainfall series.
+
+The ARIMA(2,0,1) model passed the Ljung–Box test at lag 12 (p = 0.1643), indicating no significant residual autocorrelation within the first year. However, when evaluated using a longer lag structure (24 lags), the residuals remained significantly autocorrelated (p = 0.0073). This suggests that the model captures short-term dependence adequately but may not fully account for longer-term seasonal patterns present in the monthly rainfall series.
+
+```{r arima-best}
+best_arima <- arima_201  # ganti sesuai hasil coeftest + diagnostic
+
+yhat_arima_train   <- expm1(as.numeric(fitted(best_arima)))
+actual_arima_train <- as.numeric(train_monthly_ts)
+cat("ARIMA RMSE (train):", round(rmse(actual_arima_train, yhat_arima_train), 4), "\n\n")
+
+fc_arima          <- forecast(best_arima, h = length(test_monthly_ts))
+yhat_arima_test   <- expm1(as.numeric(fc_arima$mean))
+actual_arima_test <- as.numeric(test_monthly_ts)
+
+result_arima <- eval_metrics(actual_arima_test, yhat_arima_test, "ARIMA (Test)")
+rmse_arima   <- result_arima$RMSE
+mae_arima    <- result_arima$MAE
+mape_arima   <- result_arima$MAPE
+```
+
+```{r arima-plot, fig.height=4}
+autoplot(fc_arima) +
+  autolayer(test_monthly_log, series = "Actual (log scale)", color = "#D73027") +
+  labs(title = "ARIMA Forecast vs Actual (Monthly, log scale)",
+       x = "Time", y = "log(1 + Rainfall)") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r arima-residual-analysis, fig.height=8}
+resid_arima  <- residuals(best_arima)
+fitted_arima <- as.numeric(fitted(best_arima))
+
+par(mfrow = c(2, 2))
+plot(fitted_arima, resid_arima, pch = 16, col = "#378ADD",
+     main = "Residuals vs Fitted - ARIMA",
+     xlab = "Fitted (log scale)", ylab = "Residuals")
+abline(h = 0, col = "#D73027", lty = 2)
+
+hist(resid_arima, breaks = 15, col = "#74ADD1", border = "white",
+     main = "Histogram of Residuals - ARIMA", xlab = "Residuals")
+
+qqnorm(resid_arima, main = "Q-Q Plot - ARIMA Residuals", col = "#378ADD", pch = 16)
+qqline(resid_arima, col = "#D73027", lwd = 2)
+
+acf(resid_arima, main = "ACF of Residuals - ARIMA", col = "#2166AC")
+par(mfrow = c(1, 1))
+```
+
+---
+
+## 9.4 SARIMA
+
+SARIMA (p,d,q)(P,D,Q)[S] memperluas ARIMA dengan komponen seasonal eksplisit. Dengan data bulanan, seasonal period S = 12. Komponen (P,D,Q) menangkap autokorelasi yang berulang setiap 12 bulan (pola monsoon tahunan).
+
+```{r sarima-acf-pacf-seasonal, fig.height=5}
+par(mfrow = c(1, 2))
+Acf(train_monthly_log, lag.max = 36, main = "ACF - identifikasi Q seasonal (spike lag 12,24)")
+Pacf(train_monthly_log, lag.max = 36, main = "PACF - identifikasi P seasonal (spike lag 12)")
+par(mfrow = c(1, 1))
+```
+
+```{r sarima-kandidat}
+sarima_1 <- Arima(train_monthly_log, order = c(1,0,0), seasonal = c(1,0,0))
+sarima_2 <- Arima(train_monthly_log, order = c(2,0,0), seasonal = c(1,0,0))
+sarima_3 <- Arima(train_monthly_log, order = c(1,0,1), seasonal = c(1,0,0))
+sarima_4 <- Arima(train_monthly_log, order = c(2,0,1), seasonal = c(1,0,0))
+sarima_5 <- Arima(train_monthly_log, order = c(1,0,1), seasonal = c(0,0,1))
+sarima_6 <- Arima(train_monthly_log, order = c(1,0,1), seasonal = c(1,0,1))
+sarima_7 <- Arima(train_monthly_log, order = c(1,1,1), seasonal = c(1,0,0))
+sarima_8 <- Arima(train_monthly_log, order = c(1,1,1), seasonal = c(0,1,1))
+sarima_9 <- Arima(train_monthly_log, order = c(2,0,2), seasonal = c(2,1,0))
+
+sarima_aic <- data.frame(
+  Model = c("SARIMA(1,0,0)(1,0,0)12","SARIMA(2,0,0)(1,0,0)12",
+            "SARIMA(1,0,1)(1,0,0)12","SARIMA(2,0,1)(1,0,0)12",
+            "SARIMA(1,0,1)(0,0,1)12","SARIMA(1,0,1)(1,0,1)12",
+            "SARIMA(1,1,1)(1,0,0)12","SARIMA(1,1,1)(0,1,1)12", "SARIMA(2,0,2)(2,1,0)12"),
+  AIC = c(AIC(sarima_1), AIC(sarima_2), AIC(sarima_3), AIC(sarima_4),
+          AIC(sarima_5), AIC(sarima_6), AIC(sarima_7), AIC(sarima_8), AIC(sarima_9))
+)
+sarima_aic[order(sarima_aic$AIC), ]
+```
+
+```{r sarima-auto}
+fit_auto_sarima <- auto.arima(train_monthly_log, seasonal = TRUE)
+summary(fit_auto_sarima)
+```
+
+```{r sarima-coeftest}
+coeftest(sarima_8)
+coeftest(sarima_9)
+```
+
+### Diagnostic Checking — Round 1
+
+```{r sarima-diagnostic-1}
+library(nortest)
+
+# evaluasi model dengan AIC terbaik terlebih dahulu
+e_sarima_8 <- residuals(sarima_8)
+cat("=== SARIMA(1,1,1)(0,1,1)12 [AIC terbaik] ===\n")
+lillie.test(e_sarima_8)
+ljung_8 <- Box.test(e_sarima_8, lag = 12, type = "Ljung-Box")
+print(ljung_8)
+
+checkresiduals(sarima_8)
+```
+
+Jika Ljung-Box p-value < 0.05, residual belum memenuhi asumsi white noise. Ini berarti masih ada autokorelasi yang belum ditangkap model. Langkah selanjutnya adalah mencoba model dengan ordo yang lebih tinggi untuk menyerap sisa autokorelasi tersebut.
+
+
+```{r sarima-best}
+# gunakan model yang telah diperbaiki
+# best_sarima <- best_sarima_improved
+best_sarima <- sarima_8
+checkresiduals(best_sarima)
+
+yhat_sarima_train   <- expm1(as.numeric(fitted(best_sarima)))
+actual_sarima_train <- as.numeric(train_monthly_ts)
+cat("\nSARIMA RMSE (train):", round(rmse(actual_sarima_train, yhat_sarima_train), 4), "\n\n")
+
+fc_sarima          <- forecast(best_sarima, h = length(test_monthly_ts))
+yhat_sarima_test   <- expm1(as.numeric(fc_sarima$mean))
+actual_sarima_test <- as.numeric(test_monthly_ts)
+
+result_sarima <- eval_metrics(actual_sarima_test, yhat_sarima_test, "SARIMA (Test)")
+rmse_sarima   <- result_sarima$RMSE
+mae_sarima    <- result_sarima$MAE
+mape_sarima   <- result_sarima$MAPE
+```
+
+Jika setelah semua upaya perbaikan residual masih menunjukkan sisa autokorelasi (Ljung-Box p < 0.05), hal ini diakui secara transparan sebagai **limitasi model**. Pada data curah hujan bulanan yang bersifat highly stochastic dengan seri pendek (n = 72), sulit untuk mendapatkan residual yang sepenuhnya memenuhi asumsi white noise. Kondisi ini tidak membatalkan penggunaan model untuk keperluan perbandingan, namun perlu dicatat dalam interpretasi hasil bahwa SARIMA mungkin belum sepenuhnya menangkap semua dependensi temporal dalam data.
+
+```{r sarima-plot, fig.height=4}
+autoplot(fc_sarima) +
+  autolayer(test_monthly_log,
+            series = "Actual (log scale)",
+            color = "#D73027") +
+  labs(
+    title = "SARIMA(1,1,1)(0,1,1)[12] Forecast vs Actual",
+    x = "Time",
+    y = "log(1 + Rainfall)"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r sarima-residual-analysis, fig.height=8}
+resid_sarima  <- residuals(best_sarima)
+fitted_sarima <- as.numeric(fitted(best_sarima))
+
+par(mfrow = c(2, 2))
+plot(fitted_sarima, resid_sarima, pch = 16, col = "#378ADD",
+     main = "Residuals vs Fitted - SARIMA",
+     xlab = "Fitted (log scale)", ylab = "Residuals")
+abline(h = 0, col = "#D73027", lty = 2)
+
+hist(resid_sarima, breaks = 15, col = "#74ADD1", border = "white",
+     main = "Histogram of Residuals - SARIMA", xlab = "Residuals")
+
+qqnorm(resid_sarima, main = "Q-Q Plot - SARIMA Residuals", col = "#378ADD", pch = 16)
+qqline(resid_sarima, col = "#D73027", lwd = 2)
+
+acf(resid_sarima, main = "ACF of Residuals - SARIMA", col = "#2166AC")
+par(mfrow = c(1, 1))
+```
+
+---
+
+## 9.5 Neural Network, LSTM, GRU
+
+NN, LSTM, dan GRU dijalankan di Google Colab menggunakan data bulanan yang sama. Hasil dari Colab dimasukkan di section 9.6.
+
+---
+
+## 9.6 Model Comparison Summary
+
+> **Catatan MAPE:** MAPE dapat tidak stabil saat nilai aktual mendekati nol. RMSE dan MAE lebih diutamakan sebagai metrik perbandingan utama.
+
+```{r final-comparison}
+# dari Google Collab
+rmse_nn_test   <- 96.5494
+mae_nn_test    <- 69.4857
+mape_nn_test   <- 247.48
+rmse_lstm_test <- 94.1221
+mae_lstm_test  <- 72.5429
+mape_lstm_test <- 265.0799865722656
+rmse_gru_test  <- 92.0993
+mae_gru_test   <- 70.9792
+mape_gru_test  <- 244.10000610351562
+
+comparison_table <- data.frame(
+  Model = c("Seasonal Naive",
+            "TSR Seasonal", "ARIMA", "SARIMA",
+            "Neural Network", "LSTM", "GRU"),
+  RMSE  = round(c(rmse_snaive,
+                  rmse_tsr, rmse_arima, rmse_sarima,
+                  rmse_nn_test, rmse_lstm_test, rmse_gru_test), 4),
+  MAE   = round(c(mae_snaive,
+                  mae_tsr, mae_arima, mae_sarima,
+                  mae_nn_test, mae_lstm_test, mae_gru_test), 4),
+  MAPE  = round(c(mape_snaive,
+                  mape_tsr, mape_arima, mape_sarima,
+                  mape_nn_test, mape_lstm_test, mape_gru_test), 2)
+)
+
+knitr::kable(comparison_table,
+             caption = "Final Model Comparison - Monthly Test Set (mm/month)")
+```
+
+```{r final-plot, fig.height=5}
+library(ggplot2)
+comp_plot <- comparison_table[!is.na(comparison_table$RMSE), ]
+
+ggplot(comp_plot, aes(x = reorder(Model, RMSE), y = RMSE, fill = RMSE)) +
+  geom_col(width = 0.6, alpha = 0.85) +
+  geom_text(aes(label = round(RMSE, 1)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_gradient(low = "#74ADD1", high = "#D73027") +
+  scale_y_continuous(limits = c(0, max(comp_plot$RMSE) * 1.2)) +
+  labs(title = "Model Comparison - RMSE on Monthly Test Set",
+       subtitle = "Lower RMSE = better | Baseline models shown for reference",
+       x = NULL, y = "RMSE (mm/month)") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "none")
+```

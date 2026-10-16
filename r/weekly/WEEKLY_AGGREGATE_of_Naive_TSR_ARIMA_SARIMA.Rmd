@@ -1,0 +1,1518 @@
+---
+title: "Weekly AoL Time Series"
+date: "2026-05-28"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Library and Data Loading
+
+```{r libraries}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(tseries)
+library(forecast)
+library(moments)
+library(zoo)
+library(lmtest)
+library(car)
+library(nortest)
+library(Metrics)
+library(tidyr)
+```
+
+```{r load-data}
+df_raw <- read_excel("data/Dataset16Tahun.xlsx")
+
+names(df_raw)
+
+df_daily <- df_raw %>%
+  mutate(
+    Date = as.Date(
+      paste(YEAR, MO, DOY, sep = "-")
+    ),
+    rain = as.numeric(PRECTOTCORR)
+  ) %>%
+  arrange(Date)
+
+cat("Daily data loaded:", nrow(df_daily), "observations\n")
+cat("Period:", format(min(df_daily$Date)), "to", format(max(df_daily$Date)), "\n")
+
+head(df_daily)
+```
+
+---
+
+# Dataset Structure (Daily)
+
+## Basic Structure
+
+```{r structure}
+str(df_daily)
+```
+
+## Observations per Year
+
+```{r obs-per-year}
+df_daily %>%
+  group_by(YEAR) %>%
+  summarise(Total_Days = n()) %>%
+  knitr::kable(caption = "Daily observations per year")
+```
+
+Years 2012, 2016, 2020, and 2024 contain 366 observations (leap years). All other years have 365.
+
+## Missing Values and Data Quality
+
+```{r missing-values}
+cat("Missing (NA)   :", sum(is.na(df_daily$rain)), "\n")
+cat("Sentinel -999  :", sum(df_daily$rain == -999, na.rm = TRUE), "\n")
+cat("Zero-rain days :", sum(df_daily$rain == 0, na.rm = TRUE), "\n")
+cat("Duplicate dates:", sum(duplicated(df_daily$Date)), "\n")
+```
+The dataset is clean with no missing values or encoding errors. Zero-rainfall days represent valid dry days and are retained.
+
+## Descriptive Statistics (Daily)
+
+```{r summary-daily}
+summary_daily <- df_daily %>%
+  summarise(
+    N        = n(),
+    Mean     = round(mean(rain, na.rm = TRUE), 3),
+    Median   = round(median(rain, na.rm = TRUE), 3),
+    SD       = round(sd(rain, na.rm = TRUE), 3),
+    Min      = round(min(rain, na.rm = TRUE), 3),
+    Q1       = round(quantile(rain, 0.25, na.rm = TRUE), 3),
+    Q3       = round(quantile(rain, 0.75, na.rm = TRUE), 3),
+    Max      = round(max(rain, na.rm = TRUE), 3),
+    Skewness = round(skewness(rain, na.rm = TRUE), 3),
+    Kurtosis = round(kurtosis(rain, na.rm = TRUE), 3)
+  )
+
+knitr::kable(t(summary_daily), col.names = "Value",
+             caption = "Descriptive statistics of daily rainfall (mm/day)")
+```
+
+Daily rainfall is strongly right-skewed (skewness > 3.5) due to many dry days near zero and occasional extreme monsoon events. The mean (6.58 mm/day) far exceeds the median (3.94 mm/day), a typical pattern for tropical precipitation.
+
+---
+
+# Time Series Visualization
+
+## Daily Raw Series
+
+```{r plot-daily, fig.height=4}
+ggplot(df_daily, aes(x = Date, y = rain)) +
+  geom_line(color = "#2C7BB6", linewidth = 0.3, alpha = 0.7) +
+  labs(title = "Daily Rainfall in Jakarta (2010-2025)",
+       subtitle = "Source: NASA/POWER MERRA-2",
+       x = "Date", y = "Rainfall (mm/day)") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+Daily data shows high volatility with many zero values and sharp spikes during monsoon events. This noise makes it difficult to model directly, which is one reason for monthly aggregation.
+
+## Histogram dan Distribusi Harian
+
+```{r hist-daily, fig.height=4}
+par(mfrow = c(1, 2))
+hist(df_daily$rain, breaks = 60, col = "#4575B4", border = "white",
+     main = "Daily Rainfall Distribution", xlab = "mm/day",
+     xlim = c(0, 110))
+hist(log1p(df_daily$rain), breaks = 40, col = "#74ADD1", border = "white",
+     main = "Log(1+x) Transformed", xlab = "log(1 + mm/day)")
+par(mfrow = c(1, 1))
+```
+
+The raw distribution is heavily right-skewed. Log transformation substantially reduces skewness and brings the distribution closer to symmetric, which improves fit for parametric models.
+
+---
+
+# Outlier Analysis (Daily Level)
+
+Outlier analysis is performed on daily data before aggregation. Extreme daily values are caused by real meteorological events (heavy storms, monsoon surges), not measurement errors.
+
+## Identification with IQR
+
+```{r outlier-identify}
+Q1            <- quantile(df_daily$rain, 0.25, na.rm = TRUE)
+Q3            <- quantile(df_daily$rain, 0.75, na.rm = TRUE)
+IQR_val       <- IQR(df_daily$rain, na.rm = TRUE)
+bound_mild    <- Q3 + 1.5 * IQR_val
+bound_extreme <- Q3 + 3.0 * IQR_val
+
+cat("Q1  :", round(Q1, 2), "mm\n")
+cat("Q3  :", round(Q3, 2), "mm\n")
+cat("IQR :", round(IQR_val, 2), "mm\n")
+cat("Mild outlier threshold (1.5*IQR)   :", round(bound_mild, 2), "mm\n")
+cat("Extreme outlier threshold (3.0*IQR):", round(bound_extreme, 2), "mm\n\n")
+
+df_daily <- df_daily %>%
+  mutate(outlier_cat = case_when(
+    rain > bound_extreme ~ "Extreme",
+    rain > bound_mild    ~ "Mild",
+    TRUE                 ~ "Normal"
+  ))
+
+print(table(df_daily$outlier_cat))
+```
+
+The IQR method uses 3x IQR (instead of the standard 1.5x) as the extreme threshold because daily rainfall follows a naturally heavy-tailed distribution. Using 1.5x would flag too many legitimate monsoon events as outliers.
+
+## Visualisasi Outlier
+
+```{r outlier-plot, fig.height=4}
+ggplot(df_daily, aes(x = Date, y = rain)) +
+  geom_line(color = "grey70", linewidth = 0.3) +
+  geom_point(data = filter(df_daily, outlier_cat == "Extreme"),
+             aes(color = "Extreme"), size = 1.8) +
+  geom_point(data = filter(df_daily, outlier_cat == "Mild"),
+             aes(color = "Mild"), size = 1.2, alpha = 0.6) +
+  scale_color_manual(values = c("Extreme" = "#D73027", "Mild" = "#FC8D59")) +
+  labs(title = "Identified Outliers in Daily Rainfall",
+       x = "Date", y = "Rainfall (mm/day)", color = "Outlier") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+## Handling: Winsorizing
+
+Extreme values are capped (Winsorized) at the 3x IQR threshold. This approach:
+
+- Retains all observations (no data deleted)
+- Preserves the directional signal of extreme events
+- Reduces the disproportionate influence of very high values on model fitting
+
+```{r winsorize}
+df_daily <- df_daily %>%
+  mutate(rain_clean = ifelse(rain > bound_extreme, bound_extreme, rain))
+
+cat("Cap value (3*IQR bound):", round(bound_extreme, 2), "mm\n")
+cat("Values capped          :", sum(df_daily$rain > bound_extreme), "\n")
+```
+
+---
+
+# Weekly Aggregation
+
+All models are fitted on **weekly total rainfall**. The daily data is aggregated into weekly totals to reduce daily noise and better capture seasonal patterns.
+
+```{r weekly-aggregate}
+df_weekly <- df_daily %>%
+  mutate(
+    WEEK_ID = floor(as.numeric(Date - min(Date))/7) + 1
+  ) %>%
+  group_by(WEEK_ID) %>%
+  summarise(
+    week_start = min(Date),
+    week_end   = max(Date),
+    rain_weekly = sum(rain_clean, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(WEEK_ID) %>%
+  mutate(
+    t = row_number(),
+    rain_log = log1p(rain_weekly),
+
+    lag1 = lag(rain_weekly,1),
+    lag2 = lag(rain_weekly,2),
+    lag3 = lag(rain_weekly,3)
+  )
+
+cat("Weekly data:", nrow(df_weekly), "observations\n")
+
+cat(
+  "Period:",
+  format(min(df_weekly$week_start)),
+  "to",
+  format(max(df_weekly$week_end)),
+  "\n"
+)
+
+head(df_weekly)
+```
+
+```{r weekly-stats}
+summary_weekly <- df_weekly %>%
+  summarise(
+    N        = n(),
+    Mean     = round(mean(rain_weekly), 2),
+    Median   = round(median(rain_weekly), 2),
+    SD       = round(sd(rain_weekly), 2),
+    Min      = round(min(rain_weekly), 2),
+    Max      = round(max(rain_weekly), 2),
+    Skewness = round(skewness(rain_weekly), 3)
+  )
+
+knitr::kable(t(summary_weekly), col.names = "Value",
+             caption = "Descriptive statistics of weekly total rainfall (mm/week)")
+```
+
+---
+
+# Stationarity Analysis (Weekly)
+
+## Weekly Time Series Object
+
+```{r weekly-ts-obj}
+rain_weekly_ts <- ts(
+  df_weekly$rain_weekly,
+  frequency = 52
+)
+```
+
+## Visual Inspection
+
+```{r weekly-ts-plot, fig.height=4}
+autoplot(rain_weekly_ts) +
+  labs(title = "Weekly Total Rainfall Time Series (2010-2026)",
+       x = "Year", y = "Total Rainfall (mm/week)") +
+  theme_bw(base_size = 9) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+```{r}
+Q1_week <- quantile(df_weekly$rain_weekly, 0.25, na.rm = TRUE)
+Q3_week <- quantile(df_weekly$rain_weekly, 0.75, na.rm = TRUE)
+
+IQR_week <- IQR(df_weekly$rain_weekly, na.rm = TRUE)
+
+bound_mild_week <- Q3_week + 1.5 * IQR_week
+bound_extreme_week <- Q3_week + 3.0 * IQR_week
+
+cat("Q1  :", round(Q1_week, 2), "mm/week\n")
+cat("Q3  :", round(Q3_week, 2), "mm/week\n")
+cat("IQR :", round(IQR_week, 2), "mm/week\n")
+
+cat(
+  "Mild outlier threshold (1.5*IQR)   :",
+  round(bound_mild_week, 2),
+  "mm/week\n"
+)
+
+cat(
+  "Extreme outlier threshold (3.0*IQR):",
+  round(bound_extreme_week, 2),
+  "mm/week\n\n"
+)
+
+# Classification
+df_weekly <- df_weekly %>%
+  mutate(
+    outlier_cat = case_when(
+      rain_weekly > bound_extreme_week ~ "Extreme",
+      rain_weekly > bound_mild_week    ~ "Mild",
+      TRUE                             ~ "Normal"
+    )
+  )
+
+table(df_weekly$outlier_cat)
+```
+```{r}
+ggplot(df_weekly, aes(x = week_start, y = rain_weekly)) +
+
+  geom_line(color = "grey70", linewidth = 0.4) +
+
+  geom_point(
+    data = filter(df_weekly, outlier_cat == "Extreme"),
+    aes(color = "Extreme"),
+    size = 2.2
+  ) +
+
+  geom_point(
+    data = filter(df_weekly, outlier_cat == "Mild"),
+    aes(color = "Mild"),
+    size = 1.6,
+    alpha = 0.7
+  ) +
+
+  scale_color_manual(
+    values = c(
+      "Extreme" = "#D73027",
+      "Mild" = "#FC8D59"
+    )
+  ) +
+
+  labs(
+    title = "Identified Outliers in Weekly Rainfall",
+    x = "Week Start",
+    y = "Weekly Rainfall (mm/week)",
+    color = "Outlier"
+  ) +
+
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+```
+
+
+## Decomposition Plot
+
+```{r decompose-plot, fig.height=6}
+plot(decompose(rain_weekly_ts, type = "additive"))
+```
+
+Decomposition separates the series into three components:
+
+- **Trend**: no clear long-term upward or downward drift, consistent with stable climate over 5 years
+- **Seasonal**: a strong and consistent annual cycle (S = 52) repeating every year
+- **Residual**: the remaining random variation after removing trend and seasonal components
+
+The additive model is appropriate here because the seasonal amplitude (height of the peaks) stays roughly constant across years, rather than growing proportionally with the trend.
+
+## Variance Stationarity
+
+```{r boxcox-weekly}
+lambda_weekly <- BoxCox.lambda(rain_weekly_ts + 1)
+cat("BoxCox lambda (weekly):", round(lambda_weekly, 4), "\n")
+cat("Lambda mendekati 0 -> log transform disarankan\n")
+cat("Lambda mendekati 1 -> varians sudah stabil\n\n")
+
+summary(powerTransform(rain_weekly_ts + 1))
+```
+
+H0: lambda = 1 (variance stationary). If p-value < 0.05, log transformation is recommended.
+
+## ACF dan PACF (Monthly)
+
+```{r weekly-acf-pacf, fig.height=5}
+par(mfrow = c(1, 2))
+acf(rain_weekly_ts, lag.max = 36, main = "ACF - Weekly Rainfall", col = "#2166AC")
+pacf(rain_weekly_ts, lag.max = 36, main = "PACF - Weekly Rainfall", col = "#D73027")
+par(mfrow = c(1, 1))
+```
+
+## ADF Test
+
+```{r adf-weekly}
+adf_weekly <- adf.test(rain_weekly_ts, alternative = "stationary")
+print(adf_weekly)
+
+if (adf_weekly$p.value < 0.05) {
+  cat("\np-value < 0.05 -> data STASIONER (d = 0)\n")
+} else {
+  cat("\np-value > 0.05 -> data TIDAK stasioner -> pertimbangkan differencing (d = 1)\n")
+}
+```
+
+## Log Transformation Check (Weekly)
+
+```{r log-weekly, fig.height=4}
+par(mfrow = c(1, 2))
+hist(df_weekly$rain_weekly, breaks = 20, col = "#4575B4", border = "white",
+     main = "Weekly Rainfall (Original)", xlab = "mm/month")
+hist(df_weekly$rain_log, breaks = 20, col = "#74ADD1", border = "white",
+     main = "Log(1+x) Transformed", xlab = "log(1 + mm/month)")
+par(mfrow = c(1, 1))
+
+cat("Skewness original    :", round(skewness(df_weekly$rain_weekly), 3), "\n")
+cat("Skewness log-tranform:", round(skewness(df_weekly$rain_log), 3), "\n")
+```
+
+---
+
+# Train-Test Split
+
+All models use the same 80/20 split on weekly data. The split is sequential (not random) to preserve temporal order.
+
+```{r train-test-monthly}
+n_total <- nrow(df_weekly)
+n_train   <- floor(0.8 * n_total)
+n_test    <- n_total - n_train
+
+train_df <- df_weekly[1:n_train, ]
+test_df  <- df_weekly[(n_train+1):n_total, ]
+
+# ts objects
+train_weekly_ts <- ts(
+  train_df$rain_weekly,
+  frequency = 52
+)
+
+test_weekly_ts <- ts(
+  test_df$rain_weekly,
+  frequency = 52
+)
+
+train_weekly_log <- ts(
+  train_df$rain_log,
+  frequency = 52
+)
+
+test_weekly_log <- ts(
+  test_df$rain_log,
+  frequency = 52
+)
+
+cat("Total weekly obs :", n_total, "\n")
+
+cat(
+  "Train:", n_train, "weeks |",
+  format(min(train_df$week_start)),
+  "to",
+  format(max(train_df$week_end)),
+  "\n"
+)
+
+cat(
+  "Test :", n_test, "weeks |",
+  format(min(test_df$week_start)),
+  "to",
+  format(max(test_df$week_end)),
+  "\n"
+)
+```
+
+```{r}
+c(
+  nrow(df_weekly),
+  length(train_weekly_ts),
+  frequency(train_weekly_ts),
+  start(train_weekly_ts),
+  end(train_weekly_ts)
+)
+```
+
+```{r split-plot, fig.height=4}
+df_weekly %>%
+  mutate(
+    Set = ifelse(
+      WEEK_ID <= max(train_df$WEEK_ID),
+      "Training",
+      "Test"
+    )
+  ) %>%
+  ggplot(
+    aes(
+      x = week_start,
+      y = rain_weekly,
+      color = Set
+    )
+  ) +
+  geom_line(linewidth = 0.3) +
+  geom_point(size = 1) +
+  scale_color_manual(
+    values = c(
+      "Training" = "#2166AC",
+      "Test" = "#D73027"
+    )
+  ) +
+  labs(
+    title = "Train-Test Split: Weekly Rainfall (80% / 20%)",
+    x = "Week",
+    y = "Total Rainfall (mm/week)",
+    color = "Set"
+  ) +
+  theme_bw(base_size = 9) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+```
+
+---
+
+# 9. Modeling
+
+Semua model difit dan dievaluasi pada **data bulanan** (mm/month). Evaluasi menggunakan tiga metrik:
+
+- **RMSE** — sensitif terhadap error besar, unit sama dengan data
+- **MAE** — rata-rata besar error, lebih robust terhadap nilai ekstrem
+- **MAPE** — error dalam persentase
+
+**catatan:** MAPE dapat tidak stabil ketika nilai aktual mendekati nol, sehingga RMSE dan MAE lebih diutamakan sebagai metrik utama
+
+```{r eval-function}
+eval_metrics <- function(actual, predicted, model_name) {
+  mask     <- actual > 0
+  rmse_val <- rmse(actual, predicted)
+  mae_val  <- mean(abs(actual - predicted))
+  mape_val <- mean(abs((actual[mask] - predicted[mask]) / actual[mask])) * 100
+  cat(model_name, "\n")
+  cat("  RMSE:", round(rmse_val, 4), "| MAE:", round(mae_val, 4),
+      "| MAPE:", round(mape_val, 2), "%\n\n")
+  data.frame(Model = model_name,
+             RMSE  = round(rmse_val, 4),
+             MAE   = round(mae_val, 4),
+             MAPE  = round(mape_val, 2))
+}
+```
+
+---
+
+## 9.1 Baseline Models
+
+Sebelum model utama, ditetapkan dua **baseline sederhana** sebagai acuan minimum performa. Model yang baik seharusnya mengalahkan baseline ini. Jika tidak, perlu dievaluasi apakah model terlalu kompleks atau data memang sulit diprediksi.
+
+```{r}
+snaive_model <- snaive(
+  train_weekly_ts,
+  h = length(test_weekly_ts)
+)
+
+train_fit_snaive <- fitted(snaive_model)
+
+# remove NA caused by first seasonal cycle
+valid_idx <- !is.na(train_fit_snaive)
+
+actual_train_snaive <- as.numeric(train_weekly_ts)[valid_idx]
+pred_train_snaive   <- as.numeric(train_fit_snaive)[valid_idx]
+
+result_snaive_train <- eval_metrics(
+  actual_train_snaive,
+  pred_train_snaive,
+  "Seasonal Naive (Train)"
+)
+
+rmse_snaive_train <- result_snaive_train$RMSE
+mae_snaive_train  <- result_snaive_train$MAE
+mape_snaive_train <- result_snaive_train$MAPE
+
+pred_test_snaive <- as.numeric(snaive_model$mean)
+
+actual_base <- as.numeric(test_weekly_ts)
+
+result_snaive_test <- eval_metrics(
+  actual_base,
+  pred_test_snaive,
+  "Seasonal Naive (Test)"
+)
+
+rmse_snaive <- result_snaive_test$RMSE
+mae_snaive  <- result_snaive_test$MAE
+mape_snaive <- result_snaive_test$MAPE
+
+cat("\n=== Seasonal Naive ===\n")
+
+cat("\nTrain RMSE :", round(rmse_snaive_train, 4))
+cat("\nTrain MAE  :", round(mae_snaive_train, 4))
+cat("\nTrain MAPE :", round(mape_snaive_train, 4), "%\n")
+
+cat("\nTest RMSE  :", round(rmse_snaive, 4))
+cat("\nTest MAE   :", round(mae_snaive, 4))
+cat("\nTest MAPE  :", round(mape_snaive, 4), "%\n")
+```
+Seasonal Naive sangat relevan untuk data curah hujan karena pola musiman Jakarta sangat kuat dan berulang setiap tahun. Jika model ML tidak mampu mengalahkan Seasonal Naive, itu menandakan model yg lebih kompleks tidak cocok pada dataset ini.
+
+---
+
+## 9.2 Time Series Regression Seasonal (TSR Seasonal)
+
+TSR Seasonal meregresikan curah hujan bulanan terhadap **dummy variabel bulan** dan lag bulan sebelumnya. Setiap koefisien dummy menunjukkan perbedaan rata-rata curah hujan bulan tersebut dibandingkan Januari (baseline/referensi). Misalnya, jika koefisien M2 = +80, artinya Februari rata-rata 80 mm lebih basah dari Januari setelah mengontrol variabel lain.
+
+
+```{r tsr-setup}
+df_train_tsr <- train_df %>%
+  mutate(
+    WEEK_F = factor(
+      ((WEEK_ID - 1) %% 52) + 1
+    )
+  ) %>%
+  filter(
+    !is.na(lag1),
+    !is.na(lag2),
+    !is.na(lag3)
+  )
+
+cat(
+  "Training obs for TSR:",
+  nrow(df_train_tsr),
+  "\n"
+)
+
+str(df_train_tsr)
+```
+
+```{r tsr-models}
+dummy_vars <- "M2+M3+M4+M5+M6+M7+M8+M9+M10+M11+M12"
+
+m1 <- lm(
+  rain_weekly ~ WEEK_F,
+  data = df_train_tsr
+)
+
+m2 <- lm(
+  rain_weekly ~ t + WEEK_F,
+  data = df_train_tsr
+)
+
+m3 <- lm(
+  rain_weekly ~ lag1 + t + WEEK_F,
+  data = df_train_tsr
+)
+
+m4 <- lm(
+  rain_weekly ~ lag1 + lag2 + t + WEEK_F,
+  data = df_train_tsr
+)
+
+m5 <- lm(
+  rain_weekly ~ lag1 + lag2 + lag3 + t + WEEK_F,
+  data = df_train_tsr
+)
+```
+
+```{r tsr-eval-train}
+eval_tsr <- function(model, nama, train_data) {
+  actual    <- train_data$rain_weekly
+  predicted <- fitted(model)
+  idx       <- actual > 0
+  data.frame(
+    Model  = nama,
+    Adj_R2 = round(summary(model)$adj.r.squared, 4),
+    RMSE   = round(rmse(actual, predicted), 4),
+    MAE    = round(mean(abs(actual - predicted)), 4),
+    MAPE   = round(mean(abs((actual[idx] - predicted[idx]) / actual[idx])) * 100, 2),
+    AIC    = round(AIC(model), 2),
+    DW     = round(as.numeric(dwtest(model)$statistic), 4)
+  )
+}
+
+tabel_tsr <- bind_rows(
+  eval_tsr(m1, "Dummy Seasonal Only",           df_train_tsr),
+  eval_tsr(m2, "Trend + Dummy",                  df_train_tsr),
+  eval_tsr(m3, "Lag1 + Trend + Dummy",           df_train_tsr),
+  eval_tsr(m4, "Lag1+Lag2 + Trend + Dummy",      df_train_tsr),
+  eval_tsr(m5, "Lag1+Lag2+Lag3 + Trend + Dummy", df_train_tsr)
+)
+knitr::kable(tabel_tsr, caption = "TSR Seasonal Model Comparison (Training Set)")
+```
+
+```{r tsr-best}
+best_tsr_idx <- which.min(tabel_tsr$RMSE)
+best_tsr     <- list(m1, m2, m3, m4, m5)[[best_tsr_idx]]
+cat("Best TSR model:", tabel_tsr$Model[best_tsr_idx], "\n\n")
+summary(best_tsr)
+```
+
+```{r tsr-vif}
+cat("VIF values (best model):\n")
+print(round(vif(best_tsr), 2))
+cat("\nVIF > 10 = multikolinearitas serius\n")
+```
+
+```{r}
+#ubah
+# ==========================
+# Recursive Forecast TSR
+# ==========================
+
+h <- nrow(test_df)
+
+yhat_tsr <- numeric(h)
+
+lag1_last <- tail(train_df$rain_weekly, 1)
+lag2_last <- tail(train_df$rain_weekly, 2)[1]
+lag3_last <- tail(train_df$rain_weekly, 3)[1]
+
+for(i in 1:h){
+
+  row_i <- test_df[i, ]
+
+  row_i$lag1 <- lag1_last
+  row_i$lag2 <- lag2_last
+  row_i$lag3 <- lag3_last
+
+  row_i$WEEK_F <- factor(
+    ((row_i$WEEK_ID - 1) %% 52) + 1,
+    levels = levels(df_train_tsr$WEEK_F)
+  )
+
+  pred_i <- predict(m5, newdata = row_i)
+
+  yhat_tsr[i] <- pred_i
+
+  lag3_last <- lag2_last
+  lag2_last <- lag1_last
+  lag1_last <- pred_i
+}
+```
+
+```{r}
+actual_tsr <- test_df$rain_weekly
+
+idx <- actual_tsr > 0
+
+rmse_tsr <- rmse(actual_tsr, yhat_tsr)
+
+mae_tsr <- mae(actual_tsr, yhat_tsr)
+
+mape_tsr <- mean(
+  abs(
+    (actual_tsr[idx] - yhat_tsr[idx]) /
+      actual_tsr[idx]
+  )
+) * 100
+
+cat(
+  "\nTSR Weekly (Recursive Forecast)\n"
+)
+
+cat(
+  "RMSE:", round(rmse_tsr,4),
+  "| MAE:", round(mae_tsr,4),
+  "| MAPE:", round(mape_tsr,2), "%\n"
+)
+```
+
+---
+
+## 9.3 ARIMA
+
+ARIMA (p,d,q) memodelkan dependensi linier antar observasi melalui komponen AR dan MA. Difit pada **log-transformed monthly data** untuk menstabilkan varians. Forecast dikembalikan ke skala asli dengan `expm1()`.
+
+```{r}
+min(train_weekly_ts)
+
+sum(train_weekly_ts <= 0)
+```
+
+```{r}
+plot(train_weekly_ts)
+```
+
+
+```{r arima-stasioner}
+summary(powerTransform(train_weekly_ts + 1))
+adf.test(train_weekly_log)
+
+lambda_weekly
+```
+
+```{r arima-acf-pacf, fig.height=5}
+par(mfrow = c(1, 2))
+acf(
+  train_weekly_log,
+  lag.max = 104,
+  main = "ACF Weekly Rainfall"
+)
+
+pacf(
+  train_weekly_log,
+  lag.max = 104,
+  main = "PACF Weekly Rainfall"
+)
+par(mfrow = c(1, 1))
+```
+
+```{r}
+train_weekly_ts <- ts(
+  train_df$rain_weekly,
+  start = c(2010, 1),
+  frequency = 52
+)
+
+test_weekly_ts <- ts(
+  test_df$rain_weekly,
+  start = c(
+    2010 + floor(n_train/52),
+    (n_train %% 52) + 1
+  ),
+  frequency = 52
+)
+
+train_weekly_log <- ts(
+  train_df$rain_log,
+  start = c(2010, 1),
+  frequency = 52
+)
+
+test_weekly_log <- ts(
+  test_df$rain_log,
+  start = c(
+    2010 + floor(n_train/52),
+    (n_train %% 52) + 1
+  ),
+  frequency = 52
+)
+```
+
+
+```{r arima-kandidat}
+# ===== Weekly ARIMA Candidates =====
+
+arima_100 <- Arima(train_weekly_log, order = c(1,0,0))
+arima_200 <- Arima(train_weekly_log, order = c(2,0,0))
+arima_300 <- Arima(train_weekly_log, order = c(3,0,0))
+
+arima_101 <- Arima(train_weekly_log, order = c(1,0,1))
+arima_201 <- Arima(train_weekly_log, order = c(2,0,1))
+arima_301 <- Arima(train_weekly_log, order = c(3,0,1))
+
+arima_202 <- Arima(train_weekly_log, order = c(2,0,2))
+arima_302 <- Arima(train_weekly_log, order = c(3,0,2))
+  
+arima_aic <- data.frame(
+  Model = c(
+    "ARIMA(1,0,0)",
+    "ARIMA(2,0,0)",
+    "ARIMA(3,0,0)",
+    "ARIMA(1,0,1)",
+    "ARIMA(2,0,1)",
+    "ARIMA(3,0,1)",
+    "ARIMA(2,0,2)",
+    "ARIMA(3,0,2)"
+  ),
+  AIC = c(
+    AIC(arima_100),
+    AIC(arima_200),
+    AIC(arima_300),
+    AIC(arima_101),
+    AIC(arima_201),
+    AIC(arima_301),
+    AIC(arima_202),
+    AIC(arima_302)
+  )
+)
+
+arima_aic[order(arima_aic$AIC), ]
+```
+
+```{r arima-auto}
+fit_auto_arima <- auto.arima(train_weekly_log, seasonal = FALSE)
+summary(fit_auto_arima)
+```
+
+```{r arima-coeftest}
+library(lmtest)
+coeftest(arima_302)
+```
+
+```{r arima-diagnostic}
+library(nortest)
+
+e_arima <- residuals(arima_302)
+
+lillie.test(e_arima)
+
+Box.test(
+  e_arima,
+  lag = 12,
+  type = "Ljung-Box"
+)
+
+checkresiduals(arima_302)
+```
+
+H₀: residual berdistribusi normal
+H₁: residual tidak berdistribusi normal
+
+H₀: residual merupakan white noise (tidak ada autokorelasi tersisa)
+H₁: residual masih mengandung autokorelasi
+
+```{r arima-best}
+best_arima <- arima_302  # ganti sesuai hasil coeftest + diagnostic
+
+# ---- Train performance ----
+yhat_arima_train <- expm1(
+  as.numeric(fitted(best_arima))
+)
+
+actual_arima_train <- as.numeric(
+  train_weekly_ts
+)
+
+cat(
+  "ARIMA RMSE (Train):",
+  round(
+    rmse(
+      actual_arima_train,
+      yhat_arima_train
+    ),
+    4
+  ),
+  "\n"
+)
+
+# ---- Forecast Test ----
+fc_arima <- forecast(
+  best_arima,
+  h = length(test_weekly_ts)
+)
+
+# back-transform ke skala asli
+yhat_arima_test <- expm1(
+  as.numeric(fc_arima$mean)
+)
+
+actual_arima_test <- as.numeric(
+  test_weekly_ts
+)
+
+# ---- Test metrics ----
+result_arima <- eval_metrics(
+  actual_arima_test,
+  yhat_arima_test,
+  "ARIMA (Weekly Test)"
+)
+
+rmse_arima <- result_arima$RMSE
+mae_arima  <- result_arima$MAE
+mape_arima <- result_arima$MAPE
+```
+
+```{r arima-plot, fig.height=4}
+autoplot(train_weekly_log, series = "Training") +
+  autolayer(fc_arima, series = "Forecast") +
+  autolayer(
+    test_weekly_log,
+    series = "Actual",
+    color = "#D73027"
+  ) +
+  labs(
+    title = "ARIMA Forecast vs Actual (Weekly, log scale)",
+    x = "Year",
+    y = "log(1 + Rainfall)"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold")
+  )
+```
+
+```{r arima-residual-analysis, fig.height=8}
+resid_arima  <- residuals(best_arima)
+fitted_arima <- as.numeric(fitted(best_arima))
+
+par(mfrow = c(2, 2))
+plot(fitted_arima, resid_arima, pch = 16, col = "#378ADD",
+     main = "Residuals vs Fitted - ARIMA",
+     xlab = "Fitted (log scale)", ylab = "Residuals")
+abline(h = 0, col = "#D73027", lty = 2)
+
+hist(resid_arima, breaks = 15, col = "#74ADD1", border = "white",
+     main = "Histogram of Residuals - ARIMA", xlab = "Residuals")
+
+qqnorm(resid_arima, main = "Q-Q Plot - ARIMA Residuals", col = "#378ADD", pch = 16)
+qqline(resid_arima, col = "#D73027", lwd = 2)
+
+acf(resid_arima, main = "ACF of Residuals - ARIMA", col = "#2166AC")
+par(mfrow = c(1, 1))
+```
+
+```{r}
+# ARIMA train metrics (add to your script)
+yhat_arima_train <- expm1(as.numeric(fitted(best_arima)))
+actual_train     <- as.numeric(train_weekly_ts)
+idx_tr           <- actual_train > 0
+
+cat("ARIMA Train RMSE:", round(rmse(actual_train, yhat_arima_train), 4), "\n")
+cat("ARIMA Train MAE :", round(mae(actual_train, yhat_arima_train), 4), "\n")
+cat("ARIMA Train MAPE:", round(mean(abs((actual_train[idx_tr] - yhat_arima_train[idx_tr]) /
+                                         actual_train[idx_tr])) * 100, 2), "%\n")
+```
+
+---
+
+## 9.4 SARIMA
+
+SARIMA (p,d,q)(P,D,Q)[S] memperluas ARIMA dengan komponen seasonal eksplisit. Dengan data bulanan, seasonal period S = 12. Komponen (P,D,Q) menangkap autokorelasi yang berulang setiap 12 bulan (pola monsoon tahunan).
+
+```{r sarima-acf-pacf-seasonal, fig.height=5}
+par(mfrow = c(1,2))
+
+Acf(
+  train_weekly_log,
+  lag.max = 104,
+  main = "ACF - Weekly log(rain)"
+)
+
+Pacf(
+  train_weekly_log,
+  lag.max = 104,
+  main = "PACF - Weekly log(rain)"
+)
+
+par(mfrow = c(1,1))
+```
+
+```{r sarima-kandidat}
+library(forecast)
+
+sarima_1 <- Arima(
+  train_weekly_log,
+  order = c(1,0,0),
+  seasonal = list(order = c(1,1,0), period = 52)
+)
+
+sarima_2 <- Arima(
+  train_weekly_log,
+  order = c(2,0,0),
+  seasonal = list(order = c(1,1,0), period = 52)
+)
+
+sarima_3 <- Arima(
+  train_weekly_log,
+  order = c(1,0,1),
+  seasonal = list(order = c(1,1,0), period = 52)
+)
+
+sarima_4 <- Arima(
+  train_weekly_log,
+  order = c(2,0,1),
+  seasonal = list(order = c(1,1,0), period = 52)
+)
+
+sarima_5 <- Arima(
+  train_weekly_log,
+  order = c(1,0,1),
+  seasonal = list(order = c(0,1,1), period = 52)
+)
+
+sarima_6 <- Arima(
+  train_weekly_log,
+  order = c(1,0,1),
+  seasonal = list(order = c(1,1,1), period = 52)
+)
+
+sarima_7 <- Arima(
+  train_weekly_log,
+  order = c(2,0,2),
+  seasonal = list(order = c(1,1,0), period = 52)
+)
+
+sarima_8 <- Arima(
+  train_weekly_log,
+  order = c(2,0,2),
+  seasonal = list(order = c(0,1,1), period = 52)
+)
+
+sarima_9 <- Arima(
+  train_weekly_log,
+  order = c(4,0,4),
+  seasonal = list(order = c(1,1,0), period = 52)
+)
+
+sarima_aic <- data.frame(
+  Model = c(
+    "SARIMA(1,0,0)(1,1,0)[52]",
+    "SARIMA(2,0,0)(1,1,0)[52]",
+    "SARIMA(1,0,1)(1,1,0)[52]",
+    "SARIMA(2,0,1)(1,1,0)[52]",
+    "SARIMA(1,0,1)(0,1,1)[52]",
+    "SARIMA(1,0,1)(1,1,1)[52]",
+    "SARIMA(2,0,2)(1,1,0)[52]",
+    "SARIMA(2,0,2)(0,1,1)[52]",
+    "SARIMA(4,0,4)(1,1,0)[52]"
+  ),
+  AIC = c(
+    AIC(sarima_1),
+    AIC(sarima_2),
+    AIC(sarima_3),
+    AIC(sarima_4),
+    AIC(sarima_5),
+    AIC(sarima_6),
+    AIC(sarima_7),
+    AIC(sarima_8),
+    AIC(sarima_9)
+  )
+)
+
+sarima_aic[order(sarima_aic$AIC), ]
+```
+
+```{r sarima-auto}
+fit_auto_sarima <- auto.arima(
+  train_weekly_log,
+  seasonal = TRUE
+)
+
+summary(fit_auto_sarima)
+```
+
+```{r sarima-coeftest}
+coeftest(sarima_8)
+coeftest(sarima_9)
+```
+
+```{r}
+# Fit the restricted model: drop ma1, keep ma2 → SARIMA(2,0,1) as approximation
+# Actually the cleaner restriction is to fix ma1 = 0
+sarima_8_restricted <- Arima(
+  train_weekly_log,
+  order = c(2, 0, 1),            # q=1 means only one MA term (effectively ma2 renamed ma1)
+  seasonal = list(order = c(0, 1, 1), period = 52)
+)
+
+cat("Full model    SARIMA(2,0,2)(0,1,1)[52] AIC:", AIC(sarima_8), "\n")
+cat("Restricted    SARIMA(2,0,1)(0,1,1)[52] AIC:", AIC(sarima_8_restricted), "\n")
+coeftest(sarima_8_restricted)
+```
+
+### Diagnostic Checking — Round 1
+
+```{r sarima-diagnostic-1}
+library(nortest)
+
+# evaluasi model dengan AIC terbaik terlebih dahulu
+e_sarima_8 <- residuals(sarima_8)
+cat("=== SARIMA(1,1,1)(0,1,1)12 [AIC terbaik] ===\n")
+lillie.test(e_sarima_8)
+ljung_8 <- Box.test(e_sarima_8, lag = 52, type = "Ljung-Box")
+print(ljung_8)
+
+checkresiduals(sarima_8)
+```
+
+Jika Ljung-Box p-value < 0.05, residual belum memenuhi asumsi white noise. Ini berarti masih ada autokorelasi yang belum ditangkap model. Langkah selanjutnya adalah mencoba model dengan ordo yang lebih tinggi untuk menyerap sisa autokorelasi tersebut.
+
+
+```{r sarima-best}
+# gunakan model yang telah diperbaiki
+# best_sarima <- best_sarima_improved
+best_sarima <- sarima_8
+checkresiduals(best_sarima)
+
+# =========================
+# TRAIN PERFORMANCE
+# =========================
+yhat_sarima_train <- expm1(as.numeric(fitted(best_sarima)))
+actual_sarima_train <- as.numeric(train_weekly_ts)
+
+cat(
+  "\nSARIMA RMSE (train):",
+  round(rmse(actual_sarima_train, yhat_sarima_train), 4),
+  "\n\n"
+)
+
+# =========================
+# TEST FORECAST
+# =========================
+fc_sarima <- forecast(
+  best_sarima,
+  h = length(test_weekly_ts)
+)
+
+yhat_sarima_test <- expm1(as.numeric(fc_sarima$mean))
+actual_sarima_test <- as.numeric(test_weekly_ts)
+
+result_sarima <- eval_metrics(
+  actual_sarima_test,
+  yhat_sarima_test,
+  "SARIMA (Test)"
+)
+
+rmse_sarima <- result_sarima$RMSE
+mae_sarima  <- result_sarima$MAE
+mape_sarima <- result_sarima$MAPE
+
+result_sarima
+```
+
+```{r}
+fc_sarima_df <- data.frame(
+  week = test_df$week_start,
+  mean = as.numeric(fc_sarima$mean),
+  lower80 = fc_sarima$lower[,1],
+  upper80 = fc_sarima$upper[,1],
+  lower95 = fc_sarima$lower[,2],
+  upper95 = fc_sarima$upper[,2]
+)
+
+actual_weekly_df <- data.frame(
+  week = test_df$week_start,
+  actual = as.numeric(test_weekly_log)
+)
+
+ggplot() +
+  geom_line(
+    data = actual_weekly_df,
+    aes(x = week, y = actual, color = "Actual"),
+    linewidth = 0.8
+  ) +
+  geom_ribbon(
+    data = fc_sarima_df,
+    aes(x = week, ymin = lower95, ymax = upper95),
+    fill = "#9E9AC8",
+    alpha = 0.35
+  ) +
+  geom_ribbon(
+    data = fc_sarima_df,
+    aes(x = week, ymin = lower80, ymax = upper80),
+    fill = "#6A51A3",
+    alpha = 0.45
+  ) +
+  geom_line(
+    data = fc_sarima_df,
+    aes(x = week, y = mean, color = "Forecast"),
+    linewidth = 0.9
+  ) +
+  scale_color_manual(
+    values = c(
+      "Actual" = "black",
+      "Forecast" = "#2166AC"
+    )
+  ) +
+  labs(
+    title = "SARIMA Forecast vs Actual (Weekly, log scale)",
+    x = "Week",
+    y = "log(1 + Rainfall)",
+    color = NULL
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "top"
+  )
+```
+
+
+```{r sarima-residual-analysis, fig.height=8}
+resid_sarima  <- residuals(best_sarima)
+fitted_sarima <- as.numeric(fitted(best_sarima))
+
+par(mfrow = c(2, 2))
+
+plot(
+  fitted_sarima,
+  resid_sarima,
+  pch = 16,
+  col = "#378ADD",
+  main = "Residuals vs Fitted - SARIMA",
+  xlab = "Fitted (log scale)",
+  ylab = "Residuals"
+)
+abline(h = 0, col = "#D73027", lty = 2)
+
+hist(
+  resid_sarima,
+  breaks = 15,
+  col = "#74ADD1",
+  border = "white",
+  main = "Histogram of Residuals - SARIMA",
+  xlab = "Residuals"
+)
+
+qqnorm(
+  resid_sarima,
+  main = "Q-Q Plot - SARIMA Residuals",
+  col = "#378ADD",
+  pch = 16
+)
+qqline(
+  resid_sarima,
+  col = "#D73027",
+  lwd = 2
+)
+
+acf(
+  resid_sarima,
+  main = "ACF of Residuals - SARIMA"
+)
+
+par(mfrow = c(1,1))
+```
+
+```{r}
+# SARIMA train metrics (add to your script)
+yhat_arima_train <- expm1(as.numeric(fitted(best_sarima)))
+actual_train     <- as.numeric(train_weekly_ts)
+idx_tr           <- actual_train > 0
+
+cat("SARIMA Train RMSE:", round(rmse(actual_train, yhat_sarima_train), 4), "\n")
+cat("SARIMA Train MAE :", round(mae(actual_train, yhat_sarima_train), 4), "\n")
+cat("SARIMA Train MAPE:", round(mean(abs((actual_train[idx_tr] - yhat_sarima_train[idx_tr]) /
+                                         actual_train[idx_tr])) * 100, 2), "%\n")
+```
+
+---
+
+## 9.5 Neural Network, LSTM, GRU
+
+NN, LSTM, dan GRU dijalankan di Google Colab menggunakan data bulanan yang sama. Hasil dari Colab dimasukkan di section 9.6.
+
+---
+
+## 9.6 Model Comparison Summary
+
+> **Catatan MAPE:** MAPE dapat tidak stabil saat nilai aktual mendekati nol. RMSE dan MAE lebih diutamakan sebagai metrik perbandingan utama.
+
+```{r final-comparison}
+# dari Google Collab
+rmse_nn_test   <- 33.1963
+mae_nn_test    <- 22.6467
+mape_nn_test   <- 1614.42
+rmse_lstm_test <- 32.4571
+mae_lstm_test  <- 23.1068
+mape_lstm_test <- 1803.6199951171875
+rmse_gru_test  <- 33.478
+mae_gru_test   <- 23.4008
+mape_gru_test  <- 1450.3499755859375
+
+comparison_table <- data.frame(
+  Model = c(
+    "Seasonal Naive",
+    "TSR Seasonal",
+    "ARIMA",
+    "SARIMA",
+    "Neural Network",
+    "LSTM",
+    "GRU"
+  ),
+  RMSE = round(c(
+    result_snaive_test$RMSE,
+    rmse_tsr, rmse_arima, rmse_sarima,
+    rmse_nn_test, rmse_lstm_test, rmse_gru_test
+  ), 4),
+  MAE = round(c(
+    result_snaive_test$MAE,
+    mae_tsr, mae_arima, mae_sarima,
+    mae_nn_test, mae_lstm_test, mae_gru_test
+  ), 4),
+  MAPE = round(c(
+    result_snaive_test$MAPE,
+    mape_tsr, mape_arima, mape_sarima,
+    mape_nn_test, mape_lstm_test, mape_gru_test
+  ), 2)
+)
+
+# order by RMSE (smallest = best)
+comparison_table <- comparison_table[
+  order(comparison_table$RMSE),
+]
+
+knitr::kable(
+  comparison_table,
+  caption = "Final Model Comparison - Weekly Test Set (Ordered by RMSE)"
+)
+```
+
+```{r final-plot, fig.height=5}
+library(ggplot2)
+comp_plot <- comparison_table[!is.na(comparison_table$RMSE), ]
+
+modelCom <- ggplot(comp_plot, aes(x = reorder(Model, RMSE), y = RMSE, fill = RMSE)) +
+  geom_col(width = 0.6, alpha = 0.85) +
+  geom_text(aes(label = round(RMSE, 1)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_gradient(low = "#74ADD1", high = "#D73027") +
+  scale_y_continuous(limits = c(0, max(comp_plot$RMSE) * 1.2)) +
+  labs(title = "Model Comparison - RMSE on Weekly Test Set",
+       subtitle = "Lower RMSE = better | Baseline models shown for reference",
+       x = NULL, y = "RMSE (mm/week)") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "none")
+```
+# MORE PLOTS
+
+```{r}
+snaive_fc <- snaive(
+  train_weekly_ts,
+  h = length(test_weekly_ts)
+)
+yhat_snaive <- as.numeric(snaive_fc$mean)
+
+df_snaive <- data.frame(
+  Index = seq_along(test_weekly_ts),
+  Actual = as.numeric(test_weekly_ts),
+  Forecast = yhat_snaive
+)
+
+pNaive <- ggplot(df_snaive, aes(Index)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Forecast, color = "Seasonal Naive")) +
+  labs(
+    title = "Seasonal Naive Forecast vs Actual",
+    x = "Week Index",
+    y = "Rainfall (mm/week)"
+  ) +
+  scale_color_manual(values = c(
+    "Actual" = "black",
+    "Seasonal Naive" = "#2C7FB8"
+  )) +
+  theme_bw()
+```
+
+
+```{r}
+df_tsr <- data.frame(
+  Index = seq_along(actual_tsr),
+  Actual = actual_tsr,
+  Forecast = yhat_tsr
+)
+
+p_tsr <- ggplot(df_tsr, aes(Index)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Forecast, color = "TSR")) +
+  labs(
+    title = "TSR Forecast vs Actual",
+    x = "Week Index",
+    y = "Rainfall (mm/week)"
+  ) +
+  scale_color_manual(values = c(
+    "Actual" = "black",
+    "TSR" = "#2C7FB8"
+  )) +
+  theme_bw()
+
+p_tsr
+
+ggsave(
+  "05_TSR.png",
+  p_tsr,
+  width = 10,
+  height = 5,
+  dpi = 300
+)
+```
+
+```{r}
+df_arima <- data.frame(
+  Index = seq_along(actual_arima_test),
+  Actual = actual_arima_test,
+  Forecast = yhat_arima_test
+)
+
+pARIMA <- ggplot(df_arima, aes(Index)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Forecast, color = "ARIMA")) +
+  labs(
+    title = "ARIMA Forecast vs Actual",
+    x = "Week Index",
+    y = "Rainfall (mm/week)"
+  ) +
+  scale_color_manual(values = c(
+    "Actual" = "black",
+    "ARIMA" = "#2C7FB8"
+  )) +
+  theme_bw()
+```
+
+```{r}
+df_sarima <- data.frame(
+  Index = seq_along(actual_sarima_test),
+  Actual = actual_sarima_test,
+  Forecast = yhat_sarima_test
+)
+
+pSARIMA <- ggplot(df_sarima, aes(Index)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Forecast, color = "SARIMA")) +
+  labs(
+    title = "SARIMA Forecast vs Actual",
+    x = "Week Index",
+    y = "Rainfall (mm/week)"
+  ) +
+  scale_color_manual(values = c(
+    "Actual" = "black",
+    "SARIMA" = "#2C7FB8"
+  )) +
+  theme_bw()
+```
+
+```{r}
+ggsave(
+  filename = "compareW.png",
+  plot = modelCom,
+  width = 10,
+  height = 5,
+  dpi = 300
+)
+```
+
